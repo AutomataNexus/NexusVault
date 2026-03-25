@@ -5,10 +5,11 @@
 //! lifecycle management, and audit logging.
 //!
 //! Usage:
-//!   nexusvault --port 8200 --data-dir /var/lib/nexusvault --passphrase "my-secret"
+//!   nexusvault --port 8200 --data-dir /var/lib/nexusvault --passphrase "my-secret" --api-key "my-api-key"
 //!
 //! Environment variables:
 //!   NEXUSVAULT_PASSPHRASE  - Vault passphrase (alternative to --passphrase)
+//!   NEXUSVAULT_API_KEY     - API key for authentication (alternative to --api-key)
 //!   RUST_LOG               - Log level filter (default: info)
 
 use std::net::SocketAddr;
@@ -16,15 +17,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{delete, get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use aegis_vault::{AegisVault, VaultConfig, VaultError};
 
@@ -34,7 +36,7 @@ use aegis_vault::{AegisVault, VaultConfig, VaultError};
 
 /// NexusVault - Zero-dependency secrets management server
 #[derive(Parser, Debug)]
-#[command(name = "nexusvault", version = "0.2.2", about = "Standalone secrets management server")]
+#[command(name = "nexusvault", version = "0.2.3", about = "Standalone secrets management server")]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value = "8200")]
@@ -63,14 +65,73 @@ struct Args {
     /// Disable auto-unseal on startup (vault starts sealed)
     #[arg(long)]
     start_sealed: bool,
+
+    /// API key for bearer token authentication. Can also be set via NEXUSVAULT_API_KEY env var.
+    /// If not set, the server will refuse to start (use --no-auth to disable).
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// Disable API key authentication (NOT recommended for production)
+    #[arg(long)]
+    no_auth: bool,
+
+    /// Component name bound to this API key (used for access control). Defaults to "api".
+    #[arg(long, default_value = "api")]
+    component_name: String,
+
+    /// Path to TLS certificate file (PEM format). Enables HTTPS when set with --tls-key.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to TLS private key file (PEM format). Enables HTTPS when set with --tls-cert.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
 // Application State
 // ---------------------------------------------------------------------------
 
+/// Simple rate limiter: tracks attempt timestamps within a rolling window.
+struct RateLimiter {
+    attempts: parking_lot::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    max_attempts: usize,
+    window: std::time::Duration,
+}
+
+impl RateLimiter {
+    fn new(max_attempts: usize, window: std::time::Duration) -> Self {
+        Self {
+            attempts: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            max_attempts,
+            window,
+        }
+    }
+
+    /// Returns true if the request is allowed, false if rate-limited.
+    fn check(&self) -> bool {
+        let mut attempts = self.attempts.lock();
+        let now = std::time::Instant::now();
+        // Evict expired entries
+        while attempts.front().map_or(false, |t| now.duration_since(*t) > self.window) {
+            attempts.pop_front();
+        }
+        if attempts.len() >= self.max_attempts {
+            return false;
+        }
+        attempts.push_back(now);
+        true
+    }
+}
+
 struct AppState {
     vault: AegisVault,
+    api_key: Option<String>,
+    /// When auth is enabled, this is the verified component name for the API key.
+    /// Overrides self-reported component query parameters.
+    authenticated_component: Option<String>,
+    /// Rate limiter for /v1/unseal endpoint (brute-force protection).
+    unseal_limiter: RateLimiter,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +281,86 @@ fn vault_error_to_status(err: &VaultError) -> StatusCode {
 
 fn error_response(err: VaultError) -> impl IntoResponse {
     let status = vault_error_to_status(&err);
+
+    // Sanitize error messages: don't leak internal details to clients
+    let client_message = match &err {
+        VaultError::Sealed => "vault is sealed".to_string(),
+        VaultError::SecretNotFound(key) => format!("secret not found: {key}"),
+        VaultError::AccessDenied(_) => "access denied".to_string(),
+        VaultError::InvalidPassphrase => "invalid passphrase".to_string(),
+        VaultError::AlreadyExists(key) => format!("already exists: {key}"),
+        // Never expose internal crypto, IO, or implementation details
+        VaultError::Encryption(_) | VaultError::Io(_) | VaultError::Other(_) => {
+            error!("Internal error: {}", err);
+            "internal server error".to_string()
+        }
+    };
+
     (
         status,
         Json(ErrorResponse {
-            error: err.to_string(),
+            error: client_message,
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Middleware
+// ---------------------------------------------------------------------------
+
+/// Authenticated component name, injected by the auth middleware.
+#[derive(Clone)]
+struct AuthenticatedComponent(String);
+
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+    if let Some(ref expected_key) = state.api_key {
+        let auth_header = request
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+
+        let authenticated = match auth_header {
+            Some(header) if header.starts_with("Bearer ") => {
+                let token = &header[7..];
+                token == expected_key.as_str()
+            }
+            _ => false,
+        };
+
+        if !authenticated {
+            warn!("Rejected unauthenticated request to {}", request.uri().path());
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid or missing API key — use 'Authorization: Bearer <key>'".into(),
+                }),
+            ));
+        }
+
+        // Inject the verified component identity, overriding self-reported values
+        if let Some(ref component) = state.authenticated_component {
+            request
+                .extensions_mut()
+                .insert(AuthenticatedComponent(component.clone()));
+        }
+    }
+
+    Ok(next.run(request).await)
+}
+
+/// Resolve the component name: use authenticated identity if available, else fallback to query param.
+fn resolve_component(
+    auth: Option<&AuthenticatedComponent>,
+    self_reported: &str,
+) -> String {
+    match auth {
+        Some(AuthenticatedComponent(name)) => name.clone(),
+        None => self_reported.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +371,7 @@ fn error_response(err: VaultError) -> impl IntoResponse {
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
-        version: "0.2.2",
+        version: "0.2.3",
         sealed: state.vault.is_sealed(),
     })
 }
@@ -255,12 +390,14 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// GET /v1/secrets/:key
 async fn secret_get(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthenticatedComponent>>,
     Path(key): Path<String>,
     Query(query): Query<ComponentQuery>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
+    let component = resolve_component(auth.as_ref().map(|e| &e.0), &query.component);
     state
         .vault
-        .get(&key, &query.component)
+        .get(&key, &component)
         .map(|value| Json(SecretGetResponse { key, value }))
         .map_err(error_response)
 }
@@ -268,12 +405,14 @@ async fn secret_get(
 /// PUT /v1/secrets/:key
 async fn secret_set(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthenticatedComponent>>,
     Path(key): Path<String>,
     Json(body): Json<SecretSetRequest>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
+    let component = resolve_component(auth.as_ref().map(|e| &e.0), &body.component);
     state
         .vault
-        .set(&key, &body.value, &body.component)
+        .set(&key, &body.value, &component)
         .map(|_| (StatusCode::CREATED, Json(serde_json::json!({"message": "secret stored", "key": key}))))
         .map_err(error_response)
 }
@@ -281,12 +420,14 @@ async fn secret_set(
 /// DELETE /v1/secrets/:key
 async fn secret_delete(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthenticatedComponent>>,
     Path(key): Path<String>,
     Query(query): Query<ComponentQuery>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
+    let component = resolve_component(auth.as_ref().map(|e| &e.0), &query.component);
     state
         .vault
-        .delete(&key, &query.component)
+        .delete(&key, &component)
         .map(|_| Json(serde_json::json!({"message": "secret deleted", "key": key})))
         .map_err(error_response)
 }
@@ -294,11 +435,13 @@ async fn secret_delete(
 /// GET /v1/secrets
 async fn secret_list(
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthenticatedComponent>>,
     Query(query): Query<SecretListQuery>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
+    let component = resolve_component(auth.as_ref().map(|e| &e.0), &query.component);
     state
         .vault
-        .list(&query.prefix, &query.component)
+        .list(&query.prefix, &component)
         .map(|keys| Json(SecretListResponse { keys }))
         .map_err(error_response)
 }
@@ -322,6 +465,16 @@ async fn unseal(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UnsealRequest>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
+    if !state.unseal_limiter.check() {
+        warn!("Unseal rate limit exceeded");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "too many unseal attempts — try again later".into(),
+            }),
+        ));
+    }
+
     state
         .vault
         .unseal(&body.passphrase)
@@ -331,7 +484,15 @@ async fn unseal(
                 message: "vault unsealed".to_string(),
             })
         })
-        .map_err(error_response)
+        .map_err(|err| {
+            let status = vault_error_to_status(&err);
+            (
+                status,
+                Json(ErrorResponse {
+                    error: err.to_string(),
+                }),
+            )
+        })
 }
 
 /// POST /v1/transit/keys
@@ -424,6 +585,28 @@ async fn audit(
 }
 
 // ---------------------------------------------------------------------------
+// Security Hardening
+// ---------------------------------------------------------------------------
+
+/// Disable core dumps on Linux to prevent master key exposure via memory dumps.
+fn disable_core_dumps() {
+    #[cfg(target_os = "linux")]
+    {
+        // PR_SET_DUMPABLE = 4, arg = 0 (not dumpable)
+        let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        if ret == 0 {
+            tracing::info!("Core dumps disabled (PR_SET_DUMPABLE=0)");
+        } else {
+            tracing::warn!("Failed to disable core dumps via prctl");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::debug!("Core dump protection not available on this platform");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -437,7 +620,24 @@ async fn main() {
         )
         .init();
 
+    // Security hardening: prevent core dumps from leaking key material
+    disable_core_dumps();
+
     let args = Args::parse();
+
+    // Resolve API key from CLI arg or environment variable
+    let api_key = args
+        .api_key
+        .or_else(|| std::env::var("NEXUSVAULT_API_KEY").ok());
+
+    if api_key.is_none() && !args.no_auth {
+        error!("No API key configured. Set --api-key or NEXUSVAULT_API_KEY, or use --no-auth to disable (not recommended).");
+        std::process::exit(1);
+    }
+
+    if args.no_auth {
+        warn!("Running WITHOUT API key authentication — do NOT use in production");
+    }
 
     // Resolve passphrase from CLI arg or environment variable
     let passphrase = args
@@ -470,29 +670,41 @@ async fn main() {
         }
     };
 
-    let state = Arc::new(AppState { vault });
+    let authenticated_component = if api_key.is_some() {
+        Some(args.component_name.clone())
+    } else {
+        None
+    };
 
-    // Build router
-    let app = Router::new()
-        // Health check
-        .route("/health", get(health))
-        // Vault status
+    let state = Arc::new(AppState {
+        vault,
+        api_key,
+        authenticated_component,
+        unseal_limiter: RateLimiter::new(5, std::time::Duration::from_secs(60)),
+    });
+
+    // Build router — /health is unauthenticated, all /v1/* routes require auth
+    let authenticated_routes = Router::new()
         .route("/v1/status", get(status))
-        // Secret CRUD
         .route("/v1/secrets", get(secret_list))
         .route("/v1/secrets/{key}", get(secret_get))
         .route("/v1/secrets/{key}", put(secret_set))
         .route("/v1/secrets/{key}", delete(secret_delete))
-        // Seal / Unseal
         .route("/v1/seal", post(seal))
         .route("/v1/unseal", post(unseal))
-        // Transit encryption
         .route("/v1/transit/keys", get(transit_list_keys))
         .route("/v1/transit/keys", post(transit_create_key))
         .route("/v1/transit/encrypt", post(transit_encrypt))
         .route("/v1/transit/decrypt", post(transit_decrypt))
-        // Audit log
         .route("/v1/audit", get(audit))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(authenticated_routes)
         .with_state(state);
 
     let addr = SocketAddr::from((
@@ -503,16 +715,37 @@ async fn main() {
         args.port,
     ));
 
-    info!("NexusVault server starting on http://{}", addr);
     info!(
         "Endpoints: GET /health, GET /v1/status, GET|PUT|DELETE /v1/secrets/{{key}}, POST /v1/seal, POST /v1/unseal"
     );
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("Failed to bind to address");
-
-    axum::serve(listener, app)
-        .await
-        .expect("Server failed");
+    // Start with TLS if cert and key are provided
+    match (args.tls_cert, args.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            info!("NexusVault server starting on https://{} (TLS enabled)", addr);
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("Failed to load TLS certificate/key: {}", e);
+                    std::process::exit(1);
+                });
+            axum_server::bind_rustls(addr, tls_config)
+                .serve(app.into_make_service())
+                .await
+                .expect("TLS server failed");
+        }
+        (None, None) => {
+            info!("NexusVault server starting on http://{} (no TLS — use a reverse proxy for production)", addr);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("Failed to bind to address");
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed");
+        }
+        _ => {
+            error!("Both --tls-cert and --tls-key must be provided together");
+            std::process::exit(1);
+        }
+    }
 }

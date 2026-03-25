@@ -11,7 +11,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"/></a>
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust 1.75+"/>
-  <img src="https://img.shields.io/badge/version-0.2.2-green.svg" alt="Version 0.2.2"/>
+  <img src="https://img.shields.io/badge/version-0.2.3-green.svg" alt="Version 0.2.3"/>
   <img src="https://img.shields.io/badge/tests-63-brightgreen.svg" alt="Tests: 63"/>
   <img src="https://img.shields.io/badge/LOC-2475-informational.svg" alt="LOC: 2475"/>
 </p>
@@ -101,11 +101,11 @@ Access to secrets is governed by policies that restrict which components can per
 
 ### Bounded Audit Log
 
-Every vault operation -- reads, writes, deletes, seal/unseal events, transit operations -- is recorded in an in-memory audit log implemented as a bounded `VecDeque`. When the log reaches its configured maximum capacity, the oldest entries are evicted. Each entry records the timestamp, operation type, key (if applicable), requesting component, success/failure status, and optional detail message.
+Every vault operation -- reads, writes, deletes, seal/unseal events, transit operations -- is recorded in an in-memory audit log implemented as a bounded `VecDeque`. When the log reaches its configured maximum capacity, the oldest entries are evicted. Each entry records the timestamp, operation type, key (if applicable), requesting component, success/failure status, and optional detail message. When `data_dir` is configured, audit entries are also appended to an `audit.log` file as JSON lines for durable persistence across restarts.
 
 ### Disk Persistence
 
-When a `data_dir` is configured, the vault persists its encrypted data to disk after every mutation. The secrets map is serialized to JSON, encrypted as a single AES-256-GCM blob using the master key, and written atomically via a temp-file-and-rename pattern. The master key itself is stored separately in `vault.key`, encrypted with the passphrase-derived key. On startup, the vault loads both files and auto-unseals if configured.
+When a `data_dir` is configured, the vault persists its encrypted data to disk after every mutation. The secrets map is serialized to JSON, encrypted as a single AES-256-GCM blob using the master key, and written atomically via a temp-file-and-rename pattern. The master key itself is stored separately in `vault.key`, encrypted with the passphrase-derived key. Transit encryption keys are persisted to `transit.dat`, also encrypted with the master key. On startup, the vault loads all persisted files and auto-unseals if configured. All vault files are created with `0600` permissions (owner-only read/write).
 
 ### Auto-Unseal
 
@@ -133,47 +133,67 @@ NexusVault exposes all vault operations over a JSON REST API built on Axum. The 
 # Build from source
 cargo build --release
 
-# Run with in-memory storage (development)
-./target/release/nexusvault --port 8200
+# Run with in-memory storage (development, no auth)
+./target/release/nexusvault --port 8200 --no-auth --passphrase "dev-passphrase"
 
-# Run with disk persistence (production)
+# Run with disk persistence and authentication (production)
 ./target/release/nexusvault \
   --port 8200 \
   --data-dir /var/lib/nexusvault \
-  --passphrase "your-secure-passphrase"
+  --passphrase "your-secure-passphrase" \
+  --api-key "your-api-key"
+
+# Run with TLS enabled (production)
+./target/release/nexusvault \
+  --port 8200 \
+  --data-dir /var/lib/nexusvault \
+  --passphrase "your-secure-passphrase" \
+  --api-key "your-api-key" \
+  --tls-cert /path/to/cert.pem \
+  --tls-key /path/to/key.pem
 
 # Start sealed (requires explicit unseal)
 ./target/release/nexusvault \
   --port 8200 \
   --data-dir /var/lib/nexusvault \
+  --api-key "your-api-key" \
   --start-sealed
 ```
 
 ### Basic Usage with curl
 
 ```bash
-# Check health
+# Check health (no auth required)
 curl http://localhost:8200/health
+
+# All /v1/* endpoints require Bearer token authentication:
+API_KEY="your-api-key"
 
 # Store a secret
 curl -X PUT http://localhost:8200/v1/secrets/db/password \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"value": "s3cret!", "component": "myapp"}'
 
 # Retrieve a secret
-curl http://localhost:8200/v1/secrets/db/password?component=myapp
+curl -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8200/v1/secrets/db/password?component=myapp
 
 # List secrets by prefix
-curl "http://localhost:8200/v1/secrets?prefix=db/&component=myapp"
+curl -H "Authorization: Bearer $API_KEY" \
+  "http://localhost:8200/v1/secrets?prefix=db/&component=myapp"
 
 # Delete a secret
-curl -X DELETE "http://localhost:8200/v1/secrets/db/password?component=myapp"
+curl -X DELETE -H "Authorization: Bearer $API_KEY" \
+  "http://localhost:8200/v1/secrets/db/password?component=myapp"
 
 # Seal the vault
-curl -X POST http://localhost:8200/v1/seal
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8200/v1/seal
 
-# Unseal the vault
-curl -X POST http://localhost:8200/v1/unseal \
+# Unseal the vault (rate limited: 5 attempts per 60 seconds)
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8200/v1/unseal \
   -H "Content-Type: application/json" \
   -d '{"passphrase": "your-secure-passphrase"}'
 ```
@@ -433,11 +453,11 @@ pub struct VaultAuditEntry {
 
 ## REST API Endpoints
 
-All endpoints accept and return JSON. The base URL is `http://<host>:<port>`.
+All `/v1/*` endpoints require a valid `Authorization: Bearer <api-key>` header (unless `--no-auth` is used). The `/health` endpoint is always unauthenticated. The base URL is `http://<host>:<port>` (or `https://` when TLS is enabled).
 
 | Method | Path | Description | Request Body | Response |
 |--------|------|-------------|--------------|----------|
-| `GET` | `/health` | Health check | -- | `{"status":"ok","version":"0.2.2","sealed":false}` |
+| `GET` | `/health` | Health check (no auth) | -- | `{"status":"ok","version":"0.2.3","sealed":false}` |
 | `GET` | `/v1/status` | Vault status | -- | `{"sealed":false,"secret_count":5,"transit_key_count":2,"uptime_secs":3600}` |
 | `GET` | `/v1/secrets/{key}` | Get a secret | Query: `?component=myapp` | `{"key":"db/password","value":"s3cret!"}` |
 | `PUT` | `/v1/secrets/{key}` | Store a secret | `{"value":"s3cret!","component":"myapp"}` | `{"message":"secret stored","key":"db/password"}` |
@@ -457,10 +477,11 @@ All endpoints accept and return JSON. The base URL is `http://<host>:<port>`.
 |------|---------|
 | `200` | Success |
 | `201` | Created (secret stored, transit key created) |
-| `401` | Unauthorized (invalid passphrase on unseal) |
+| `401` | Unauthorized (invalid passphrase on unseal, or missing/invalid API key) |
 | `403` | Forbidden (access control denied) |
 | `404` | Not found (secret or transit key does not exist) |
 | `409` | Conflict (transit key already exists) |
+| `429` | Too many requests (unseal rate limit exceeded) |
 | `503` | Service unavailable (vault is sealed) |
 
 ### Error Response Format
@@ -496,8 +517,13 @@ All errors return a JSON body with an `error` field:
 | `--host` | | `127.0.0.1` | Host to bind to |
 | `--data-dir` | `-d` | None | Data directory for persistence |
 | `--passphrase` | | None | Vault passphrase (or set `NEXUSVAULT_PASSPHRASE` env var) |
+| `--api-key` | | None | API key for bearer token authentication (or set `NEXUSVAULT_API_KEY` env var). Required unless `--no-auth` is used. |
+| `--no-auth` | | `false` | Disable API key authentication (NOT recommended for production) |
+| `--component-name` | | `api` | Component name bound to the API key for access control |
+| `--tls-cert` | | None | Path to TLS certificate file (PEM). Enables HTTPS when used with `--tls-key`. |
+| `--tls-key` | | None | Path to TLS private key file (PEM). Enables HTTPS when used with `--tls-cert`. |
 | `--max-versions` | | `10` | Maximum secret versions per key |
-| `--audit-log-max` | | `10000` | Maximum audit log entries |
+| `--audit-log-max` | | `10000` | Maximum in-memory audit log entries |
 | `--start-sealed` | | `false` | Start the vault in sealed state |
 
 ### Environment Variables
@@ -505,6 +531,7 @@ All errors return a JSON body with an `error` field:
 | Variable | Description |
 |----------|-------------|
 | `NEXUSVAULT_PASSPHRASE` | Vault passphrase (alternative to `--passphrase` flag) |
+| `NEXUSVAULT_API_KEY` | API key for authentication (alternative to `--api-key` flag) |
 | `AEGIS_VAULT_PASSPHRASE` | Vault passphrase (used by the `aegis-vault` library directly) |
 | `RUST_LOG` | Log level filter (default: `info`). Examples: `debug`, `nexusvault=debug,aegis_vault=trace` |
 
@@ -550,12 +577,14 @@ AES-256-GCM provides a 128-bit authentication tag, ensuring that any tampering w
 
 ### Disk Persistence
 
-When persistence is enabled, two files are written to the `data_dir`:
+When persistence is enabled, the following files are written to the `data_dir`:
 
 - **`vault.key`** -- The master key encrypted with the passphrase-derived key. Format: `salt (16) + nonce (12) + AES-256-GCM(master_key)`.
 - **`vault.dat`** -- The entire secrets map serialized to JSON, then encrypted with the master key. Format: `nonce (12) + AES-256-GCM(json_blob)`.
+- **`transit.dat`** -- Transit encryption keys serialized to JSON, encrypted with the master key.
+- **`audit.log`** -- Append-only JSON lines audit log for durable persistence across restarts.
 
-Both files are written atomically using a temp-file-and-rename strategy to prevent corruption on crash.
+All files are created with `0600` permissions (owner-only read/write on Unix). Encrypted files are written atomically using a temp-file-and-rename strategy to prevent corruption on crash.
 
 ### Access Control
 
@@ -617,10 +646,10 @@ The seal state does not affect the encrypted data on disk -- it only controls wh
 | **Seal/Unseal** | Single passphrase | Shamir's Secret Sharing (multiple keys) |
 | **Key Derivation** | PBKDF2-HMAC-SHA256 (100K iterations) | Shamir + AES-256-GCM |
 | **Access Control** | Component + prefix policies | Full ACL with paths, capabilities, tokens |
-| **Audit Log** | In-memory bounded VecDeque | File, syslog, socket backends |
+| **Audit Log** | In-memory + persistent JSON lines file | File, syslog, socket backends |
 | **Secret Versioning** | Built-in, configurable retention | KV v2 engine |
 | **Dynamic Secrets** | Not supported | Database, AWS, PKI, SSH, etc. |
-| **Authentication** | Component identity | Tokens, AppRole, LDAP, OIDC, Kubernetes |
+| **Authentication** | Bearer token API key + component binding | Tokens, AppRole, LDAP, OIDC, Kubernetes |
 | **Replication** | Not built-in (use with Aegis-DB) | Integrated HA with Raft |
 | **License** | Apache-2.0 | BSL 1.1 (source-available, not open-source) |
 | **Resource Usage** | ~5 MB memory, instant startup | ~100 MB+ memory, slower startup |
@@ -679,7 +708,7 @@ If you want to use NexusVault as a library in your own Rust project, add the `ae
 
 ```toml
 [dependencies]
-aegis-vault = { git = "https://github.com/automatanexus/Aegis-DB.git", version = "0.2.2" }
+aegis-vault = { git = "https://github.com/automatanexus/Aegis-DB.git", version = "0.2.3" }
 ```
 
 ### Cross-compilation
@@ -701,21 +730,27 @@ cargo build --release --target aarch64-apple-darwin
 ### Storing Database Credentials
 
 ```bash
+API_KEY="your-api-key"
+
 # Store credentials
 curl -X PUT http://localhost:8200/v1/secrets/db/postgres/host \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"value": "db.example.com", "component": "webapp"}'
 
 curl -X PUT http://localhost:8200/v1/secrets/db/postgres/port \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"value": "5432", "component": "webapp"}'
 
 curl -X PUT http://localhost:8200/v1/secrets/db/postgres/password \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"value": "super-secret-password", "component": "webapp"}'
 
 # Retrieve all database secrets
-curl "http://localhost:8200/v1/secrets?prefix=db/postgres/&component=webapp"
+curl -H "Authorization: Bearer $API_KEY" \
+  "http://localhost:8200/v1/secrets?prefix=db/postgres/&component=webapp"
 # {"keys":["db/postgres/host","db/postgres/port","db/postgres/password"]}
 ```
 
@@ -724,17 +759,20 @@ curl "http://localhost:8200/v1/secrets?prefix=db/postgres/&component=webapp"
 ```bash
 # Create an encryption key for user PII
 curl -X POST http://localhost:8200/v1/transit/keys \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name": "user-pii"}'
 
 # Encrypt a social security number
 curl -X POST http://localhost:8200/v1/transit/encrypt \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"key_name": "user-pii", "plaintext": "123-45-6789"}'
 # {"ciphertext":"vault:v1:BASE64_ENCODED_CIPHERTEXT"}
 
 # Decrypt it back
 curl -X POST http://localhost:8200/v1/transit/decrypt \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"key_name": "user-pii", "ciphertext": "vault:v1:BASE64_ENCODED_CIPHERTEXT"}'
 # {"plaintext":"123-45-6789"}
@@ -744,7 +782,8 @@ curl -X POST http://localhost:8200/v1/transit/decrypt \
 
 ```bash
 # Get the last 20 audit entries
-curl "http://localhost:8200/v1/audit?limit=20"
+curl -H "Authorization: Bearer $API_KEY" \
+  "http://localhost:8200/v1/audit?limit=20"
 # {
 #   "entries": [
 #     {

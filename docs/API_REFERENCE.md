@@ -1,6 +1,8 @@
 # NexusVault REST API Reference
 
-Base URL: `http://<host>:<port>` (default: `http://127.0.0.1:8200`)
+Base URL: `http://<host>:<port>` (default: `http://127.0.0.1:8200`), or `https://` when TLS is enabled.
+
+All `/v1/*` endpoints require authentication via the `Authorization: Bearer <api-key>` header (unless `--no-auth` is used). The `/health` endpoint is always unauthenticated.
 
 All request and response bodies use JSON (`Content-Type: application/json`).
 
@@ -21,7 +23,7 @@ curl http://localhost:8200/health
 ```json
 {
   "status": "ok",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "sealed": false
 }
 ```

@@ -165,13 +165,13 @@ Note the double encryption: individual secret values are encrypted with the mast
 
 5. **Supply chain attacks:** NexusVault depends on third-party Rust crates (`aes-gcm`, `ring`, `parking_lot`, `serde`, etc.). A compromised dependency could exfiltrate secrets. **Mitigation:** Pin dependency versions, audit `Cargo.lock`, use `cargo-audit` to check for known vulnerabilities.
 
-6. **Network-level attacks:** The REST API does not include TLS. An attacker on the network path can intercept secret values in transit. **Mitigation:** Deploy behind a TLS-terminating reverse proxy (e.g., nginx, Caddy) or add TLS support to the server.
+6. **Network-level attacks:** The REST API supports native TLS via rustls (`--tls-cert` and `--tls-key` flags). Without TLS, an attacker on the network path can intercept secret values in transit. **Mitigation:** Enable TLS with `--tls-cert` and `--tls-key`, or deploy behind a TLS-terminating reverse proxy (e.g., nginx, Caddy).
 
-7. **Denial of service:** There is no built-in rate limiting on the REST API. An attacker can flood the server with requests. **Mitigation:** Deploy behind a rate-limiting reverse proxy.
+7. **Denial of service:** The `/v1/unseal` endpoint is rate-limited (5 attempts per 60-second window) to prevent brute-force attacks. Other endpoints do not have built-in rate limiting. **Mitigation:** Deploy behind a rate-limiting reverse proxy for comprehensive protection.
 
-8. **Authentication:** The REST API does not require authentication tokens. Any client that can reach the network endpoint can read and write secrets. The `component` parameter is self-reported and not verified. **Mitigation:** Restrict network access via firewall rules, deploy on localhost only, or add an authentication middleware layer.
+8. **Authentication:** The REST API requires bearer token authentication (`Authorization: Bearer <api-key>`) for all `/v1/*` endpoints. The API key is configured via `--api-key` or `NEXUSVAULT_API_KEY`. When authenticated, component identity is bound to the API key via `--component-name`, preventing self-reported identity spoofing. **Mitigation:** Always use `--api-key` in production (the server refuses to start without it unless `--no-auth` is explicitly set).
 
-9. **Transit key persistence:** Transit encryption keys are held only in memory. If the NexusVault process restarts, all transit keys are lost and previously encrypted data cannot be decrypted. **Mitigation:** This is a known limitation. For durable transit keys, persist them as vault secrets or implement transit key persistence in a future version.
+9. **Error information disclosure:** API error responses for encryption, IO, and internal errors return generic messages ("internal server error") rather than raw error details. Detailed error information is logged server-side only.
 
 ---
 
@@ -200,20 +200,22 @@ The unseal operation:
 
 1. **Use a strong passphrase:** At least 20 characters, randomly generated. Store it in a secure location (e.g., a hardware security module, a separate secrets manager, or an encrypted file accessible only during deployment).
 
-2. **Start sealed in production:** Use `--start-sealed` and implement an operational procedure for unsealing (e.g., a human operator or an automated unsealing service).
+2. **Always use API key authentication:** Set `--api-key` (or `NEXUSVAULT_API_KEY`). The server refuses to start without it unless `--no-auth` is explicitly passed. Never use `--no-auth` in production.
 
-3. **Restrict network access:** Bind to `127.0.0.1` and access only via localhost or a secure tunnel. Do not expose the API to the public internet without TLS and authentication.
+3. **Enable TLS:** Use `--tls-cert` and `--tls-key` for native HTTPS support, or deploy behind a TLS-terminating reverse proxy. Without TLS, secrets and the passphrase are transmitted in cleartext.
 
-4. **Deploy behind TLS:** Use a reverse proxy (nginx, Caddy, HAProxy) with TLS termination, or add native TLS support.
+4. **Start sealed in production:** Use `--start-sealed` and implement an operational procedure for unsealing (e.g., a human operator or an automated unsealing service).
 
-5. **Disable core dumps:** On Linux, set `prctl(PR_SET_DUMPABLE, 0)` or configure `/proc/sys/kernel/core_pattern` to discard cores.
+5. **Restrict network access:** Bind to `127.0.0.1` and access only via localhost or a secure tunnel. Do not expose the API to the public internet without TLS and authentication.
 
-6. **Monitor the audit log:** Periodically retrieve and archive audit entries. Alert on failed operations, especially failed unseal attempts (which may indicate brute-force attacks).
+6. **Core dumps are disabled automatically:** NexusVault calls `prctl(PR_SET_DUMPABLE, 0)` on Linux at startup. For additional protection, configure `/proc/sys/kernel/core_pattern` to discard cores.
 
-7. **Rotate the passphrase periodically:** To rotate the passphrase, unseal with the current passphrase, re-initialize with a new passphrase (this re-encrypts the master key), and seal.
+7. **File permissions are set automatically:** All vault files (`vault.key`, `vault.dat`, `transit.dat`, `audit.log`) are created with `0600` permissions (owner-only read/write) on Unix systems.
 
-8. **Keep dependencies updated:** Run `cargo audit` regularly and update dependencies when security patches are released.
+8. **Monitor the audit log:** The audit log is persisted to `audit.log` as JSON lines when `data_dir` is configured. Monitor for failed operations, especially failed unseal attempts (rate-limited to 5 per 60 seconds).
 
-9. **File permissions:** Ensure `vault.key` and `vault.dat` are readable only by the NexusVault process user (`chmod 600`).
+9. **Rotate the passphrase periodically:** To rotate the passphrase, unseal with the current passphrase, re-initialize with a new passphrase (this re-encrypts the master key), and seal.
 
-10. **Backup strategy:** Back up `vault.key` and `vault.dat` together. Both files are required to restore the vault. The passphrase is also required -- without it, the backup is useless.
+10. **Keep dependencies updated:** Run `cargo audit` regularly and update dependencies when security patches are released.
+
+11. **Backup strategy:** Back up `vault.key`, `vault.dat`, and `transit.dat` together. All files are required to restore the vault. The passphrase is also required -- without it, the backup is useless.
