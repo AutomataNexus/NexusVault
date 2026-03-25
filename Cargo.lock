@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-common"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "chrono",
@@ -30,8 +30,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "aegis-vault"
-version = "0.2.2"
+name = "aegis-db-vault"
+version = "0.2.3"
 dependencies = [
  "aegis-common",
  "aes-gcm",
@@ -891,7 +891,7 @@ name = "nexusvault"
 version = "0.2.3"
 dependencies = [
  "aegis-common",
- "aegis-vault",
+ "aegis-db-vault",
  "axum",
  "axum-server",
  "base64",

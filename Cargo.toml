@@ -5,14 +5,18 @@ edition = "2021"
 description = "Zero-dependency secrets management for Rust applications"
 license = "Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/AutomataNexus/NexusVault"
+homepage = "https://github.com/AutomataNexus/NexusVault"
+keywords = ["secrets", "vault", "encryption", "security"]
+categories = ["cryptography"]
 
 [[bin]]
 name = "nexusvault"
 path = "src/main.rs"
 
 [dependencies]
-aegis-vault = { path = "../Aegis-DB/crates/aegis-vault" }
-aegis-common = { path = "../Aegis-DB/crates/aegis-common" }
+aegis-vault = { package = "aegis-db-vault", version = "0.2.3", path = "../Aegis-DB/crates/aegis-vault" }
+aegis-common = { version = "0.2.3", path = "../Aegis-DB/crates/aegis-common" }
 axum = "0.7"
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
