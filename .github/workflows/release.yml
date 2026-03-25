@@ -24,18 +24,8 @@ jobs:
       - name: Checkout NexusVault
         uses: actions/checkout@v4
 
-      - name: Checkout Aegis-DB (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: AutomataNexus/Aegis-DB
-          path: Aegis-DB-src
-
-      - name: Symlink Aegis-DB to expected path
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/Aegis-DB-src" "$GITHUB_WORKSPACE/../Aegis-DB"
-          echo "Symlink created:"
-          ls -la "$GITHUB_WORKSPACE/../Aegis-DB"
-          ls "$GITHUB_WORKSPACE/../Aegis-DB/crates/" || echo "crates dir not found"
+      - name: Clone Aegis-DB (path dependency)
+        run: git clone --depth 1 https://github.com/AutomataNexus/Aegis-DB.git "$GITHUB_WORKSPACE/../Aegis-DB"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
