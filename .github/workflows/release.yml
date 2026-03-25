@@ -23,15 +23,12 @@ jobs:
     steps:
       - name: Checkout NexusVault
         uses: actions/checkout@v4
-        with:
-          path: NexusVault
 
-      - name: Checkout Aegis-DB (dependency)
+      - name: Checkout Aegis-DB (path dependency)
         uses: actions/checkout@v4
         with:
           repository: AutomataNexus/Aegis-DB
-          path: Aegis-DB
-          token: ${{ secrets.GITHUB_TOKEN }}
+          path: ../Aegis-DB
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,13 +39,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            NexusVault/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('NexusVault/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Build release binary
-        working-directory: NexusVault
         run: cargo build --release
 
       - name: Set artifact info
@@ -56,7 +52,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME}
           ARTIFACT="nexusvault-${VERSION}-linux-x86_64"
-          cp NexusVault/target/release/nexusvault "${ARTIFACT}"
+          cp target/release/nexusvault "${ARTIFACT}"
           echo "artifact_name=${ARTIFACT}" >> "$GITHUB_OUTPUT"
 
       - name: Compute SHA-256 digest
