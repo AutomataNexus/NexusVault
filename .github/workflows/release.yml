@@ -31,7 +31,11 @@ jobs:
           path: Aegis-DB-src
 
       - name: Symlink Aegis-DB to expected path
-        run: ln -s "$GITHUB_WORKSPACE/Aegis-DB-src" "$GITHUB_WORKSPACE/../Aegis-DB"
+        run: |
+          ln -sfn "$GITHUB_WORKSPACE/Aegis-DB-src" "$GITHUB_WORKSPACE/../Aegis-DB"
+          echo "Symlink created:"
+          ls -la "$GITHUB_WORKSPACE/../Aegis-DB"
+          ls "$GITHUB_WORKSPACE/../Aegis-DB/crates/" || echo "crates dir not found"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
