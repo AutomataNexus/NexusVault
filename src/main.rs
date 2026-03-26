@@ -36,7 +36,7 @@ use aegis_vault::{AegisVault, VaultConfig, VaultError};
 
 /// NexusVault - Zero-dependency secrets management server
 #[derive(Parser, Debug)]
-#[command(name = "nexusvault", version = "0.2.3", about = "Standalone secrets management server")]
+#[command(name = "nexusvault", version = "0.2.4", about = "Standalone secrets management server")]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value = "8200")]

@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "nexusvault"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aegis-common",
  "aegis-db-vault",
