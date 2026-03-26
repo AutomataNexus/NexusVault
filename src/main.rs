@@ -21,7 +21,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{get, post},
     Extension, Json, Router,
 };
 use clap::Parser;
@@ -686,14 +686,14 @@ async fn main() {
     // Build router — /health is unauthenticated, all /v1/* routes require auth
     let authenticated_routes = Router::new()
         .route("/v1/status", get(status))
-        .route("/v1/secrets", get(secret_list))
-        .route("/v1/secrets/{key}", get(secret_get))
-        .route("/v1/secrets/{key}", put(secret_set))
-        .route("/v1/secrets/{key}", delete(secret_delete))
+        .route("/v1/secrets/", get(secret_list))
+        .route(
+            "/v1/secrets/{key}",
+            get(secret_get).put(secret_set).delete(secret_delete),
+        )
         .route("/v1/seal", post(seal))
         .route("/v1/unseal", post(unseal))
-        .route("/v1/transit/keys", get(transit_list_keys))
-        .route("/v1/transit/keys", post(transit_create_key))
+        .route("/v1/transit/keys", get(transit_list_keys).post(transit_create_key))
         .route("/v1/transit/encrypt", post(transit_encrypt))
         .route("/v1/transit/decrypt", post(transit_decrypt))
         .route("/v1/audit", get(audit))
