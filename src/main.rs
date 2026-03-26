@@ -371,7 +371,7 @@ fn resolve_component(
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
-        version: "0.2.3",
+        version: "0.2.4",
         sealed: state.vault.is_sealed(),
     })
 }
@@ -684,27 +684,23 @@ async fn main() {
     });
 
     // Build router — /health is unauthenticated, all /v1/* routes require auth
-    let authenticated_routes = Router::new()
+    // /v1/secrets (collection) for listing, /v1/secret/{key} (singular) for CRUD
+    // Separated to avoid axum 0.7 path conflict between /prefix and /prefix/{param}
+    let app = Router::new()
+        .route("/health", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/secrets/", get(secret_list))
-        .route(
-            "/v1/secrets/{key}",
-            get(secret_get).put(secret_set).delete(secret_delete),
-        )
+        .route("/v1/secrets", get(secret_list))
+        .route("/v1/secrets/:key", get(secret_get).put(secret_set).delete(secret_delete))
         .route("/v1/seal", post(seal))
         .route("/v1/unseal", post(unseal))
         .route("/v1/transit/keys", get(transit_list_keys).post(transit_create_key))
         .route("/v1/transit/encrypt", post(transit_encrypt))
         .route("/v1/transit/decrypt", post(transit_decrypt))
         .route("/v1/audit", get(audit))
-        .route_layer(middleware::from_fn_with_state(
+        .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,
-        ));
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(authenticated_routes)
+        ))
         .with_state(state);
 
     let addr = SocketAddr::from((
